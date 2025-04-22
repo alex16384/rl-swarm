@@ -46,11 +46,37 @@ if [ -f "modal-login/temp-data/userData.json" ]; then
     npm install --legacy-peer-deps
     
     echo -e "\n${CYAN}${BOLD}[✓] Starting the development server...${NC}"
-    pid=$(lsof -ti:3000); if [ -n "$pid" ]; then kill -9 $pid; fi
-    sleep 3
+    # Ensure 'ss' is installed
+    if ! command -v ss &>/dev/null; then
+      echo -e "${YELLOW}[!] 'ss' not found. Attempting to install 'iproute2'...${NC}"
+      if command -v apt &>/dev/null; then
+        sudo apt update && sudo apt install -y iproute2
+      elif command -v yum &>/dev/null; then
+        sudo yum install -y iproute
+      elif command -v pacman &>/dev/null; then
+        sudo pacman -Sy iproute2
+      else
+        echo -e "${RED}[✗] Could not install 'ss'. Package manager not found.${NC}"
+        exit 1
+      fi
+    fi
+    
+    # Check if port 3000 is in use using ss
+    PORT_LINE=$(ss -ltnp | grep ":3000 ")
+    if [ -n "$PORT_LINE" ]; then
+      PID=$(echo "$PORT_LINE" | grep -oP 'pid=\K[0-9]+')
+      if [ -n "$PID" ]; then
+        echo -e "${YELLOW}[!] Port 3000 is in use. Killing process: $PID${NC}"
+        kill -9 $PID
+        sleep 2
+      fi
+    fi
+    
+    # Start the dev server
     npm run dev > server.log 2>&1 &
     SERVER_PID=$!
-    MAX_WAIT=60  
+    MAX_WAIT=30  
+    
     for ((i = 0; i < MAX_WAIT; i++)); do
         if grep -q "Local:        http://localhost:" server.log; then
             PORT=$(grep "Local:        http://localhost:" server.log | sed -n 's/.*http:\/\/localhost:\([0-9]*\).*/\1/p')
@@ -77,29 +103,38 @@ else
 
     echo -e "\n${CYAN}${BOLD}[✓] Installing dependencies with npm. This may take a few minutes, depending on your internet speed...${NC}"
     npm install --legacy-peer-deps
-
+    
     echo -e "\n${CYAN}${BOLD}[✓] Starting the development server...${NC}"
-    pid=$(lsof -ti:3000); if [ -n "$pid" ]; then kill -9 $pid; fi
-    sleep 3
+    # Ensure 'ss' is installed
+    if ! command -v ss &>/dev/null; then
+      echo -e "${YELLOW}[!] 'ss' not found. Attempting to install 'iproute2'...${NC}"
+      if command -v apt &>/dev/null; then
+        sudo apt update && sudo apt install -y iproute2
+      elif command -v yum &>/dev/null; then
+        sudo yum install -y iproute
+      elif command -v pacman &>/dev/null; then
+        sudo pacman -Sy iproute2
+      else
+        echo -e "${RED}[✗] Could not install 'ss'. Package manager not found.${NC}"
+        exit 1
+      fi
+    fi
+    
+    # Check if port 3000 is in use using ss
+    PORT_LINE=$(ss -ltnp | grep ":3000 ")
+    if [ -n "$PORT_LINE" ]; then
+      PID=$(echo "$PORT_LINE" | grep -oP 'pid=\K[0-9]+')
+      if [ -n "$PID" ]; then
+        echo -e "${YELLOW}[!] Port 3000 is in use. Killing process: $PID${NC}"
+        kill -9 $PID
+        sleep 2
+      fi
+    fi
+    
+    # Start the dev server
     npm run dev > server.log 2>&1 &
     SERVER_PID=$!
-    MAX_WAIT=60  
-    for ((i = 0; i < MAX_WAIT; i++)); do
-        if grep -q "Local:        http://localhost:" server.log; then
-            PORT=$(grep "Local:        http://localhost:" server.log | sed -n 's/.*http:\/\/localhost:\([0-9]*\).*/\1/p')
-            if [ -n "$PORT" ]; then
-                echo -e "${GREEN}${BOLD}[✓] Server is running successfully on port $PORT.${NC}"
-                break
-            fi
-        fi
-        sleep 1
-    done
-    
-    if [ $i -eq $MAX_WAIT ]; then
-        echo -e "${RED}${BOLD}[✗] Timeout waiting for server to start.${NC}"
-        kill $SERVER_PID 2>/dev/null || true
-        exit 1
-    fi
+    MAX_WAIT=30  
 
     echo -e "\n${CYAN}${BOLD}[✓] Detecting system architecture...${NC}"
     ARCH=$(uname -m)
