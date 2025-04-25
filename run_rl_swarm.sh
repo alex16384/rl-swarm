@@ -17,6 +17,7 @@ export HOST_MULTI_ADDRS
 export IDENTITY_PATH
 export ORG_ID
 export HF_HUB_DOWNLOAD_TIMEOUT=120
+export TUNNEL_TYPE=""
 
 DEFAULT_PUB_MULTI_ADDRS=""
 PUB_MULTI_ADDRS=${PUB_MULTI_ADDRS:-$DEFAULT_PUB_MULTI_ADDRS}
@@ -46,7 +47,6 @@ if [ -f "modal-login/temp-data/userData.json" ]; then
     npm install --legacy-peer-deps
     
     echo -e "\n${CYAN}${BOLD}[✓] Starting the development server...${NC}"
-    # Ensure 'ss' is installed
     if ! command -v ss &>/dev/null; then
       echo -e "${YELLOW}[!] 'ss' not found. Attempting to install 'iproute2'...${NC}"
       if command -v apt &>/dev/null; then
@@ -61,7 +61,6 @@ if [ -f "modal-login/temp-data/userData.json" ]; then
       fi
     fi
     
-    # Check if port 3000 is in use using ss
     PORT_LINE=$(ss -ltnp | grep ":3000 ")
     if [ -n "$PORT_LINE" ]; then
       PID=$(echo "$PORT_LINE" | grep -oP 'pid=\K[0-9]+')
@@ -72,7 +71,6 @@ if [ -f "modal-login/temp-data/userData.json" ]; then
       fi
     fi
     
-    # Start the dev server
     npm run dev > server.log 2>&1 &
     SERVER_PID=$!
     MAX_WAIT=30  
@@ -105,7 +103,6 @@ else
     npm install --legacy-peer-deps
     
     echo -e "\n${CYAN}${BOLD}[✓] Starting the development server...${NC}"
-    # Ensure 'ss' is installed
     if ! command -v ss &>/dev/null; then
       echo -e "${YELLOW}[!] 'ss' not found. Attempting to install 'iproute2'...${NC}"
       if command -v apt &>/dev/null; then
@@ -120,7 +117,6 @@ else
       fi
     fi
     
-    # Check if port 3000 is in use using ss
     PORT_LINE=$(ss -ltnp | grep ":3000 ")
     if [ -n "$PORT_LINE" ]; then
       PID=$(echo "$PORT_LINE" | grep -oP 'pid=\K[0-9]+')
@@ -131,10 +127,26 @@ else
       fi
     fi
     
-    # Start the dev server
     npm run dev > server.log 2>&1 &
     SERVER_PID=$!
     MAX_WAIT=30  
+    
+    for ((i = 0; i < MAX_WAIT; i++)); do
+        if grep -q "Local:        http://localhost:" server.log; then
+            PORT=$(grep "Local:        http://localhost:" server.log | sed -n 's/.*http:\/\/localhost:\([0-9]*\).*/\1/p')
+            if [ -n "$PORT" ]; then
+                echo -e "${GREEN}${BOLD}[✓] Server is running successfully on port $PORT.${NC}"
+                break
+            fi
+        fi
+        sleep 1
+    done
+    
+    if [ $i -eq $MAX_WAIT ]; then
+        echo -e "${RED}${BOLD}[✗] Timeout waiting for server to start.${NC}"
+        kill $SERVER_PID 2>/dev/null || true
+        exit 1
+    fi
 
     echo -e "\n${CYAN}${BOLD}[✓] Detecting system architecture...${NC}"
     ARCH=$(uname -m)
@@ -155,6 +167,38 @@ else
         echo -e "${RED}[✗] Unsupported architecture: $ARCH. Please use a supported system.${NC}"
         exit 1
     fi
+
+    check_url() {
+        local url=$1
+        local max_retries=3
+        local retry=0
+        
+        while [ $retry -lt $max_retries ]; do
+            http_code=$(curl -s -o /dev/null -w "%{http_code}" "$url" 2>/dev/null)
+            if [ "$http_code" = "200" ] || [ "$http_code" = "404" ] || [ "$http_code" = "301" ] || [ "$http_code" = "302" ]; then
+                return 0
+            fi
+            retry=$((retry + 1))
+            sleep 2
+        done
+        return 1
+    }
+
+    install_localtunnel() {
+        if command -v lt >/dev/null 2>&1; then
+            echo -e "${GREEN}${BOLD}[✓] Localtunnel is already installed.${NC}"
+            return 0
+        fi
+        echo -e "\n${CYAN}${BOLD}[✓] Installing localtunnel...${NC}"
+        npm install -g localtunnel > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}${BOLD}[✓] Localtunnel installed successfully.${NC}"
+            return 0
+        else
+            echo -e "${RED}${BOLD}[✗] Failed to install localtunnel.${NC}"
+            return 1
+        fi
+    }
 
     install_cloudflared() {
         if command -v cloudflared >/dev/null 2>&1; then
@@ -207,16 +251,74 @@ else
         return 0
     }
 
-    get_url_from_method1() {
+    try_localtunnel() {
+        echo -e "\n${CYAN}${BOLD}[✓] Trying localtunnel...${NC}"
+        if install_localtunnel; then
+            echo -e "\n${CYAN}${BOLD}[✓] Starting localtunnel on port $PORT...${NC}"
+            TUNNEL_TYPE="localtunnel"
+            lt --port $PORT > localtunnel_output.log 2>&1 &
+            TUNNEL_PID=$!
+            
+            sleep 5
+            URL=$(grep -o "https://[^ ]*" localtunnel_output.log | head -n1)
+            
+            if [ -n "$URL" ]; then
+                PASS=$(curl -s https://loca.lt/mytunnelpassword)
+                FORWARDING_URL="$URL"
+                echo -e "${GREEN}${BOLD}[✓] Success! Please visit this website : ${YELLOW}${BOLD}${URL}${GREEN}${BOLD} and then enter this password : ${YELLOW}${BOLD}${PASS}${GREEN}${BOLD} to access the website and then log in using your email.${NC}"
+                return 0
+            else
+                echo -e "${RED}${BOLD}[✗] Failed to get localtunnel URL.${NC}"
+                kill $TUNNEL_PID 2>/dev/null || true
+            fi
+        fi
+        return 1
+    }
+
+    try_cloudflared() {
+        echo -e "\n${CYAN}${BOLD}[✓] Trying cloudflared...${NC}"
+        if install_cloudflared; then
+            echo -e "\n${CYAN}${BOLD}[✓] Starting cloudflared tunnel...${NC}"
+            TUNNEL_TYPE="cloudflared"
+            cloudflared tunnel --url http://localhost:$PORT > cloudflared_output.log 2>&1 &
+            TUNNEL_PID=$!
+            
+            counter=0
+            MAX_WAIT=10
+            while [ $counter -lt $MAX_WAIT ]; do
+                CLOUDFLARED_URL=$(grep -o 'https://[^ ]*\.trycloudflare.com' cloudflared_output.log | head -n1)
+                if [ -n "$CLOUDFLARED_URL" ]; then
+                    echo -e "${GREEN}${BOLD}[✓] Cloudflared tunnel is started successfully.${NC}"
+                    echo -e "\n${CYAN}${BOLD}[✓] Checking if cloudflared URL is working...${NC}"
+                    if check_url "$CLOUDFLARED_URL"; then
+                        FORWARDING_URL="$CLOUDFLARED_URL"
+                        return 0
+                    else
+                        echo -e "${RED}${BOLD}[✗] Cloudflared URL is not accessible.${NC}"
+                        kill $TUNNEL_PID 2>/dev/null || true
+                        break
+                    fi
+                fi
+                sleep 1
+                counter=$((counter + 1))
+            done
+            kill $TUNNEL_PID 2>/dev/null || true
+        fi
+        return 1
+    }
+
+    get_ngrok_url_method1() {
         local url=$(grep -o '"url":"https://[^"]*' ngrok_output.log 2>/dev/null | head -n1 | cut -d'"' -f4)
         echo "$url"
     }
 
-    get_url_from_method2() {
+    get_ngrok_url_method2() {
+        local try_port
         local url=""
         for try_port in $(seq 4040 4045); do
-            if curl -s "http://localhost:$try_port/api/tunnels" >/dev/null 2>&1; then
-                url=$(curl -s "http://localhost:$try_port/api/tunnels" | grep -o '"public_url":"https://[^"]*' | head -n1 | cut -d'"' -f4)
+            local response=$(curl -s "http://localhost:$try_port/api/tunnels" 2>/dev/null)
+            if [ -n "$response" ]; then
+                url=$(echo "$response" | grep -o '"public_url":"https://[^"]*' | head -n1 | cut -d'"' -f4)
                 if [ -n "$url" ]; then
                     break
                 fi
@@ -225,54 +327,15 @@ else
         echo "$url"
     }
 
-    get_url_from_method3() {
-        local url=$(grep -m 1 "Forwarding" ngrok_output.log 2>/dev/null | grep -o "https://[^ ]*")
+    get_ngrok_url_method3() {
+        local url=$(grep -o "Forwarding.*https://[^ ]*" ngrok_output.log 2>/dev/null | grep -o "https://[^ ]*" | head -n1)
         echo "$url"
     }
 
-    get_url_from_method4() {
-        kill $TUNNEL_PID 2>/dev/null || true
-        sleep 3
-        ngrok http --region us --log=stdout "$PORT" > ngrok_output_alt.log 2>&1 &
-        TUNNEL_PID=$!
-        sleep 10
-        local url=$(grep -o '"url":"https://[^"]*' ngrok_output_alt.log 2>/dev/null | head -n1 | cut -d'"' -f4)
-        if [ -z "$url" ]; then
-            for check_port in $(seq 4040 4050); do
-                if curl -s "http://localhost:$check_port/api/tunnels" >/dev/null 2>&1; then
-                    url=$(curl -s "http://localhost:$check_port/api/tunnels" | grep -o '"public_url":"https://[^"]*' | head -n1 | cut -d'"' -f4)
-                    if [ -n "$url" ]; then
-                        break
-                    fi
-                fi
-            done
-        fi
-        echo "$url"
-    }
-
-    start_tunnel() {
-        if install_cloudflared; then
-            echo -e "\n${CYAN}${BOLD}[✓] Starting cloudflared tunnel...${NC}"
-            cloudflared tunnel --url http://localhost:$PORT > cloudflared_output.log 2>&1 &
-            TUNNEL_PID=$!
-            counter=0
-            MAX_WAIT=30
-            while [ $counter -lt $MAX_WAIT ]; do
-                FORWARDING_URL=$(grep -o 'https://[^ ]*\.trycloudflare.com' cloudflared_output.log | head -n1)
-                if [ -n "$FORWARDING_URL" ]; then
-                    echo -e "${GREEN}${BOLD}[✓] Cloudflared tunnel started successfully.\n${NC}"
-                    return 0
-                fi
-                sleep 1
-                counter=$((counter + 1))
-            done
-            echo -e "${RED}${BOLD}[✗] Timeout waiting for cloudflared URL.${NC}"
-            kill $TUNNEL_PID 2>/dev/null || true
-        else
-            echo -e "\n${RED}${BOLD}[✗] Failed to install cloudflared, Trying using ngrok${NC}"
-        fi
-
+    try_ngrok() {
+        echo -e "\n${CYAN}${BOLD}[✓] Trying ngrok...${NC}"
         if install_ngrok; then
+            TUNNEL_TYPE="ngrok"
             while true; do
                 echo -e "\n${YELLOW}${BOLD}To get your authtoken:${NC}"
                 echo "1. Sign up or log in at https://dashboard.ngrok.com"
@@ -289,48 +352,80 @@ else
                 pkill -f ngrok || true
                 sleep 2
             
-                ngrok authtoken "$NGROK_TOKEN"
+                ngrok authtoken "$NGROK_TOKEN" 2>/dev/null
                 if [ $? -eq 0 ]; then
-                    echo -e "${GREEN}[✓] Successfully authenticated ngrok!${NC}"
+                    echo -e "${GREEN}${BOLD}[✓] Successfully authenticated ngrok!${NC}"
                     break
                 else
                     echo -e "${RED}[✗] Authentication failed. Please check your token and try again.${NC}"
                 fi
             done
 
-            ngrok http "$PORT" --log=stdout --log-format=json --log-level=info > ngrok_output.log 2>&1 &
+            echo -e "\n${CYAN}${BOLD}[✓] Starting ngrok with method 1...${NC}"
+            ngrok http "$PORT" --log=stdout --log-format=json > ngrok_output.log 2>&1 &
             TUNNEL_PID=$!
             sleep 5
-
-            FORWARDING_URL=$(get_url_from_method1)
-            if [ -z "$FORWARDING_URL" ]; then
-                FORWARDING_URL=$(get_url_from_method2)
-            fi
-            if [ -z "$FORWARDING_URL" ]; then
-                FORWARDING_URL=$(get_url_from_method3)
-            fi
-            if [ -z "$FORWARDING_URL" ]; then
-                FORWARDING_URL=$(get_url_from_method4)
-            fi
-
-            if [ -n "$FORWARDING_URL" ]; then
-                echo -e "${GREEN}${BOLD}[✓] ngrok tunnel started successfully.${NC}"
+            
+            NGROK_URL=$(get_ngrok_url_method1)
+            if [ -n "$NGROK_URL" ]; then
+                FORWARDING_URL="$NGROK_URL"
                 return 0
             else
-                echo -e "${RED}${BOLD}[✗] Failed to extract URL from ngrok.${NC}"
+                echo -e "${RED}${BOLD}[✗] Failed to get ngrok URL (method 1).${NC}"
                 kill $TUNNEL_PID 2>/dev/null || true
             fi
-        else
-            echo -e "${RED}${BOLD}[✗] Failed to install ngrok.${NC}"
-        fi
 
-        echo -e "${RED}${BOLD}[✗] Both cloudflared and ngrok failed to start the tunnel.${NC}"
+            echo -e "\n${CYAN}${BOLD}[✓] Starting ngrok with method 2...${NC}"
+            ngrok http "$PORT" > ngrok_output.log 2>&1 &
+            TUNNEL_PID=$!
+            sleep 5
+            
+            NGROK_URL=$(get_ngrok_url_method2)
+            if [ -n "$NGROK_URL" ]; then
+                FORWARDING_URL="$NGROK_URL"
+                return 0
+            else
+                echo -e "${RED}${BOLD}[✗] Failed to get ngrok URL (method 2).${NC}"
+                kill $TUNNEL_PID 2>/dev/null || true
+            fi
+
+            echo -e "\n${CYAN}${BOLD}[✓] Starting ngrok with method 3...${NC}"
+            ngrok http "$PORT" --log=stdout > ngrok_output.log 2>&1 &
+            TUNNEL_PID=$!
+            sleep 5
+            
+            NGROK_URL=$(get_ngrok_url_method3)
+            if [ -n "$NGROK_URL" ]; then
+                FORWARDING_URL="$NGROK_URL"
+                return 0
+            else
+                echo -e "${RED}${BOLD}[✗] Failed to get ngrok URL (method 3).${NC}"
+                kill $TUNNEL_PID 2>/dev/null || true
+            fi
+        fi
+        return 1
+    }
+
+    start_tunnel() {
+        if try_localtunnel; then
+            return 0
+        fi
+        
+        if try_cloudflared; then
+            return 0
+        fi
+        
+        if try_ngrok; then
+            return 0
+        fi
         return 1
     }
 
     start_tunnel
     if [ $? -eq 0 ]; then
-        echo -e "${GREEN}${BOLD}[✓] Success! Please visit this website and log in using your email:${NC} ${CYAN}${BOLD}${FORWARDING_URL}${NC}"
+        if [ "$TUNNEL_TYPE" != "localtunnel" ]; then
+            echo -e "${GREEN}${BOLD}[✓] Success! Please visit this website and log in using your email:${NC} ${CYAN}${BOLD}${FORWARDING_URL}${NC}"
+        fi
     else
         echo -e "\n${BLUE}${BOLD}[✓] Don't worry, you can use this manual method. Please follow these instructions:${NC}"
         echo "1. Open this same WSL/VPS or GPU server on another tab"
@@ -348,14 +443,14 @@ else
     done
     
     echo -e "${GREEN}${BOLD}[✓] Success! The userData.json file has been created. Proceeding with remaining setups...${NC}"
-    rm -f server.log cloudflared_output.log ngrok_output.log ngrok_output_alt.log
+    rm -f server.log localtunnel_output.log cloudflared_output.log ngrok_output.log
 
     ORG_ID=$(awk 'BEGIN { FS = "\"" } !/^[ \t]*[{}]/ { print $(NF - 1); exit }' modal-login/temp-data/userData.json)
     echo -e "\n${CYAN}${BOLD}[✓] ORG_ID has been set to: $ORG_ID\n${NC}"
 
     echo -e "${CYAN}${BOLD}[✓] Waiting for API key to become activated...${NC}"
     while true; do
-        STATUS=$(curl -s "http://localhost:$PORT/api/get-api-key-status?orgId=$ORG_ID")
+        STATUS=$(curl -s "http://localhost:3000/api/get-api-key-status?orgId=$ORG_ID")
         if [[ "$STATUS" == "activated" ]]; then
             echo -e "${GREEN}${BOLD}[✓] Success! API key is activated! Proceeding...\n${NC}"
             break
@@ -366,7 +461,18 @@ else
     done
 fi
 
-echo -e "${CYAN}${BOLD}[✓] Installing required Python packages, may take few mins depending on your internet speed...${NC}"
+if [ -n "$VIRTUAL_ENV" ]; then
+    echo -e "\n${CYAN}${BOLD}[✓] Deactivating existing virtual environment...${NC}"
+    deactivate
+fi
+
+echo -e "${CYAN}${BOLD}[✓] Setting up Python virtual environment...${NC}"
+python3 -m venv .venv && source .venv/bin/activate && \
+echo -e "${GREEN}${BOLD}[✓] Python virtual environment set up successfully.${NC}" || \
+echo -e "${RED}${BOLD}[✗] Failed to set up virtual environment.${NC}"
+
+
+echo -e "\n${CYAN}${BOLD}[✓] Installing required Python packages, may take few mins depending on your internet speed...${NC}"
 pip install --disable-pip-version-check -q -r "$ROOT"/requirements-hivemind.txt > /dev/null
 pip install --disable-pip-version-check -q -r "$ROOT"/requirements.txt > /dev/null
 
